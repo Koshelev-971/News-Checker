@@ -1,0 +1,9 @@
+from duckduckgo_search import DDGS  
+import request
+from bs4 import BeautifulSoup       
+from difflib import SequenceMatcher
+
+sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
+
+def news_input():
+print()
