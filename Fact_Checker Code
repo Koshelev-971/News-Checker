@@ -5,5 +5,17 @@ from difflib import SequenceMatcher
 
 sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
 
-def news_input():
-print()
+
+def user_input():
+    print("=== 🛡️ СИСТЕМА ПРОВЕРКИ НОВОСТЕЙ 'News Checker' ===")
+    text = input("\nВставьте текст новости для проверки: ").strip()
+    
+    # Мини-проверки
+    if len(text.split()) < 3:
+        print("Ошибка: Текст слишком короткий для анализа.")
+        return None
+    if text.replace(" ", "").isdigit():
+        print("Ошибка: Текст не может состоять только из цифр.")
+        return None
+        
+    return text
