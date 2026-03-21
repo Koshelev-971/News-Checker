@@ -7,10 +7,9 @@ sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.r
 
 
 def user_input():
-    print("=== 🛡️ СИСТЕМА ПРОВЕРКИ НОВОСТЕЙ 'News Checker' ===")
+    print("=== 'News Checker' ===")
     text = input("\nВставьте текст новости для проверки: ").strip()
-    
-    # Мини-проверки
+   
     if len(text.split()) < 3:
         print("Ошибка: Текст слишком короткий для анализа.")
         return None
@@ -19,3 +18,38 @@ def user_input():
         return None
         
     return text
+
+
+TRUSTED_SITES = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
+
+def get_similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+
+def fetch_article_text(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code != 200: return ""
+        soup = BeautifulSoup(r.text, 'html.parser')
+        paragraphs = soup.find_all('p')
+        return " ".join([p.get_text() for p in paragraphs]).strip()
+    except:
+        return ""
+
+def analyze_news(user_text):
+    results = []
+    search_query = user_text[:70]
+    
+    with DDGS() as ddgs:
+        search_results = ddgs.text(search_query, region='ru-ru', max_results=8)
+        
+        for item in search_results:
+            url = item['href']
+            if any(site in url for site in TRUSTED_SITES):
+                article_text = fetch_article_text(url)
+                if article_text:
+                    score = get_similarity(user_text, article_text[:600])
+                    results.append({'url': url, 'score': score, 'text_snippet': article_text[:100]})
+    
+    
+    return sorted(results, key=lambda x: x['score'], reverse=True)
