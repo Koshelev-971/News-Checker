@@ -5,11 +5,14 @@ from difflib import SequenceMatcher
 
 sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
 
-
 def user_input():
     print("=== 'News Checker' ===")
     text = input("\nВставьте текст новости для проверки: ").strip()
-   
+    max_s = 600
+
+    if len(text.split()) > max_s:
+        print("Ошибка: Текст слишком длинный для анализа.")
+        return None
     if len(text.split()) < 3:
         print("Ошибка: Текст слишком короткий для анализа.")
         return None
