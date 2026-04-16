@@ -1,88 +1,129 @@
-from duckduckgo_search import DDGS  
-import request
-from bs4 import BeautifulSoup       
-from difflib import SequenceMatcher
-
-sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
-
-def user_input():
-    print("=== 'News Checker' ===")
-    text = input("\nВставьте текст новости для проверки: ").strip()
-    max_s = 600
-
-    if len(text.split()) > max_s:
-        print("Ошибка: Текст слишком длинный для анализа.")
-        return None
-    if len(text.split()) < 3:
-        print("Ошибка: Текст слишком короткий для анализа.")
-        return None
-    if text.replace(" ", "").isdigit():
-        print("Ошибка: Текст не может состоять только из цифр.")
-        return None
-        
-    return text
+import streamlit as st
+import trafilatura
+from duckduckgo_search import DDGS
+from sentence_transformers import SentenceTransformer, util
+import time
+import hashlib
+import re
 
 
-TRUSTED_SITES = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
+# ==========================================
+# ЧАСТЬ 1: ЛОГИКА
+# ==========================================
+class NewsAnalyzer:
+    def __init__(self):
+        self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        self.sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "nplus1.ru"]
 
-def get_similarity(a, b):
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio() * 100
+    def _clean_text(self, text):
+        text = re.sub(r'^[А-ЯЁ\s]+,\s+\d+\s+[а-я]+\.\s+/[^/]+/', '', text)
+        return text[:200].strip()
 
-def fetch_article_text(url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(url, headers=headers, timeout=5)
-        if r.status_code != 200: return ""
-        soup = BeautifulSoup(r.text, 'html.parser')
-        paragraphs = soup.find_all('p')
-        return " ".join([p.get_text() for p in paragraphs]).strip()
-    except:
-        return ""
+    def _get_text(self, url):
+        try:
+            downloaded = trafilatura.fetch_url(url, timeout=5)
+            return trafilatura.extract(downloaded) if downloaded else None
+        except:
+            return None
 
-def analyze_news(user_text):
-    results = []
-    search_query = user_text[:70]
-    
-    with DDGS() as ddgs:
-        search_results = ddgs.text(search_query, region='ru-ru', max_results=8)
-        
-        for item in search_results:
-            url = item['href']
-            if any(site in url for site in TRUSTED_SITES):
-                article_text = fetch_article_text(url)
-                if article_text:
-                    score = get_similarity(user_text, article_text[:600])
-                    results.append({'url': url, 'score': score, 'text_snippet': article_text[:100]})
-    
-    
-    return sorted(results, key=lambda x: x['score'], reverse=True)
+    def find_best_match(self, user_text):
+        search_query = self._clean_text(user_text)
+        full_query = f"{search_query} (" + " OR ".join([f"site:{s}" for s in self.sites]) + ")"
 
-def display_report(results):
-    print("\n" + "="*60)
-print("ОТЧЕТ О ПРОВЕРКЕ СМИ")
-    print("="*60)
+        found_links = []
+        try:
+            with DDGS() as ddgs:
+                results = ddgs.text(full_query, region='ru-ru', max_results=5)
+                found_links = [r['href'] for r in results]
+        except:
+            return None
 
-    if not results:
-        print("ПОДТВЕРЖДЕНИЙ НЕ НАЙДЕНО")
-        print("Официальные источники (ТАСС, РБК и др.) не публиковали")
-        print("информацию, совпадающую с вашим запросом.")
+        if not found_links: return None
+
+        user_embedding = self.model.encode(user_text, convert_to_tensor=True)
+        best_match = {"url": None, "score": 0}
+
+        for url in found_links:
+            source_text = self._get_text(url)
+            if not source_text or len(source_text) < 150: continue
+            source_embedding = self.model.encode(source_text, convert_to_tensor=True)
+            similarity = util.cos_sim(user_embedding, source_embedding).item()
+            if similarity > best_match["score"]:
+                best_match = {"url": url, "score": similarity}
+        return best_match
+
+
+# ==========================================
+# ЧАСТЬ 2: ЗАЩИТА
+# ==========================================
+class SecurityLayer:
+    def __init__(self):
+        self.cache = {}
+        self.request_history = []
+        self.rpm_limit = 3
+
+    def check_rate_limit(self):
+        now = time.time()
+        self.request_history = [t for t in self.request_history if now - t < 60]
+        if len(self.request_history) >= self.rpm_limit:
+            return False
+        self.request_history.append(now)
+        return True
+
+    def get_cache(self, text):
+        h = hashlib.md5(text.encode()).hexdigest()
+        return self.cache.get(h)
+
+    def set_cache(self, text, result):
+        if len(self.cache) >= 50: self.cache.clear()
+        h = hashlib.md5(text.encode()).hexdigest()
+        self.cache[h] = result
+
+
+# ==========================================
+# ЧАСТЬ 3: ИНТЕРФЕЙС
+# ==========================================
+st.set_page_config(page_title="News Verifier", page_icon="🛡️")
+
+if 'brain_v3' not in st.session_state:
+    with st.spinner("Первичная настройка системы..."):
+        st.session_state.brain_v3 = NewsAnalyzer()
+        st.session_state.guard_v3 = SecurityLayer()
+
+st.title("🛡️ News Checker")
+st.write("Введите текст новости для проверки подлинности:")
+
+user_input = st.text_area(" ", height=200, key="main_input")
+
+if st.button("Проверить подлинность"):
+    if len(user_input) < 20:
+        st.error("Текст слишком короткий!")
+
+    elif not st.session_state.guard_v3.check_rate_limit():
+        st.warning("⚠️ Слишком много запросов. Подождите 60 секунд.")
+
     else:
-        max_score = results[0]['score']
+        cached = st.session_state.guard_v3.get_cache(user_input)
 
-
-        if max_score > 40:
-            print(f"ВЕРДИКТ: ИНФОРМАЦИЯ ПОДТВЕРЖДЕНА (Схожесть: {max_score:.1f}%)")
+        if cached:
+            st.info("Результат найден в кэше.")
+            result = cached
         else:
-            print(f"ВЕРДИКТ: ТЕМА УПОМИНАЕТСЯ, НО ЕСТЬ ОТЛИЧИЯ ({max_score:.1f}%)")
+            with st.spinner("ИИ анализирует официальные СМИ..."):
+                result = st.session_state.brain_v3.find_best_match(user_input)
+                if result and "error" not in result:
+                    st.session_state.guard_v3.set_cache(user_input, result)
 
-        print("\nНАЙДЕННЫЕ ОФИЦИАЛЬНЫЕ ИСТОЧНИКИ:")
-        print("-" * 60)
-        
-        for i, res in enumerate(results, 1):
-            print(f"[{i}] ИСТОЧНИК: {res['url']}")
-            print(f"    СХОЖЕСТЬ: {res['score']:.1f}%")
-            print(f"    ТЕКСТ: {res['text_snippet']}...")
-            print("-" * 60)
-            
-    print("\n" + "="*60)
-    input("Нажмите Enter для завершения...")
+        if result:
+            score = result.get('score', 0)
+            url = result.get('url', '')
+            if score >= 0.7:
+                st.success(f"### ПОДТВЕРЖДЕНО ({score:.1%})")
+                st.write(f"**Источник:** {url}")
+            elif score >= 0.4:
+                st.warning(f"### ПОХОЖЕ НА ПРАВДУ ({score:.1%})")
+                st.write(f"Источник: {url}")
+            else:
+                st.error("Точных совпадений в базе СМИ не найдено.")
+        else:
+            st.error("Новость не найдена в базе доверенных СМИ.")
