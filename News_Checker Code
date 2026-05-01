@@ -5,7 +5,9 @@ from sentence_transformers import SentenceTransformer, util
 import time
 import hashlib
 import re
-
+from urllib.parse import urlparse
+from typing import Optional, Dict, List
+import requests
 
 # ==========================================
 # ЧАСТЬ 1: ЛОГИКА
@@ -15,85 +17,141 @@ class NewsAnalyzer:
         self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
         self.sites = ["tass.ru", "rbc.ru", "ria.ru", "interfax.ru", "kommersant.ru", "lenta.ru", "rt.com"]
 
-    def extract_keywords(self, text):
-        text = re.sub(r'[^\w\s]', ' ', text)
+    def is_valid_article_url(self, url: str) -> bool:
+            try:
+                parsed = urlparse(url)
+                path = parsed.path.strip('/')
+                if not path or len(path.split('/')) < 2:
+                    return False
+                exclude = {'auth', 'login', 'reg', 'search', 'tag', 'category', 'rubric',
+                           'about', 'contacts', 'podcast', 'video', 'gallery', 'rss', 'sitemap'}
+                if path.split('/')[0].lower() in exclude:
+                    return False
+                return True
+            except:
+                return False
+
+    def extract_keywords(self, text: str, max_words: int = 12) -> str:
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
         words = text.split()
-        return " ".join(words[:12])
+        return " ".join(words[:max_words])
 
-    def get_text(self, url):
+    def get_text(self, url: str, timeout: int = 12) -> Optional[str]:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "no-cache"
+        }
+
         try:
-            downloaded = trafilatura.fetch_url(url, timeout=7)
-            if downloaded:
-                result = trafilatura.extract(downloaded)
-                return result if result and len(result) > 150 else None
-        except:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+
+            result = trafilatura.extract(
+                response.text,
+                include_comments=False,
+                include_tables=False,
+                favor_precision=True,
+                output_format='txt'
+            )
+
+            if result and len(result.strip()) > 200:
+                return result.strip()[:2000]
             return None
-        return None
 
-    def find_best_match(self, user_text):
-        keywords = self.extract_keywords(user_text)
-        all_found_links = []
+        except requests.exceptions.RequestException as e:
+            return None
+        except Exception:
+            return None
 
-        search_status = st.empty()
+    def find_best_match(self, user_text: str) -> Optional[Dict]:
+        query = self.extract_keywords(user_text)
+        if not query: return None
 
-        with DDGS() as ddgs:
-            for site in self.sites:
-                search_status.info(f"Поиск по источнику: {site}...")
-                try:
-                    query = f"{keywords} site:{site}"
-                    results = list(ddgs.text(query, region='ru-ru', max_results=3))
-                    for r in results:
-                        all_found_links.append(r['href'])
-                except:
-                    continue
-                time.sleep(0.4)
+        with st.status("🔍 Ищу в базе СМИ...", expanded=True) as status:
+            status.write(f"🔑 Ключевые слова: `{query}`")
+            all_found_links = []
 
-        if not all_found_links:
-            search_status.warning("На проверенных СМИ ничего нет. Ищу по всему интернету...")
             try:
                 with DDGS() as ddgs:
-                    results = list(ddgs.text(keywords, region='ru-ru', max_results=8))
-                    all_found_links = [r['href'] for r in results]
-            except:
-                pass
+                    # 1. Ищем именно новости (возвращает прямые ссылки на статьи)
+                    status.write("📡 Ищу в новостных лентах...")
+                    news_results = list(ddgs.news(query, region='ru-ru', max_results=8))
 
-        if not all_found_links:
-            search_status.empty()
-            return None
+                    for r in news_results:
+                        href = r.get('href', '')
+                        domain = urlparse(href).netloc
+                        # Оставляем только наши СМИ + только статьи
+                        if any(domain.endswith(s) for s in self.sites) and self.is_valid_article_url(href):
+                            all_found_links.append(href)
 
-        search_status.info(f"Найдено {len(all_found_links)} ссылок. Начинаю ИИ-анализ...")
+                    # 2. Если мало, дополняем обычным веб-поиском
+                    if len(all_found_links) < 3:
+                        status.write("🌐 Дополняю обычным поиском...")
+                        text_results = list(ddgs.text(query, region='ru-ru', max_results=8))
+                        for r in text_results:
+                            href = r.get('href', '')
+                            domain = urlparse(href).netloc
+                            if any(domain.endswith(s) for s in self.sites) and self.is_valid_article_url(
+                                    href) and href not in all_found_links:
+                                all_found_links.append(href)
 
-        user_embedding = self.model.encode(user_text, convert_to_tensor=True)
-        results_list = []
+                    # Убираем дубли и ограничиваем до 5 лучших
+                    all_found_links = list(dict.fromkeys(all_found_links))[:5]
 
-        progress_bar = st.progress(0)
-        for i, url in enumerate(all_found_links):
-            progress_bar.progress((i + 1) / len(all_found_links))
-            source_text = self.get_text(url)
+            except Exception as e:
+                status.error(f"❌ Ошибка поисковика: {type(e).__name__}")
+                return None
 
-            if not source_text: continue
+            if not all_found_links:
+                status.warning("🔍 Ссылки на статьи не найдены. Попробуйте более конкретный запрос.")
+                return None
 
-            source_embedding = self.model.encode(source_text, convert_to_tensor=True)
-            similarity = util.cos_sim(user_embedding, source_embedding).item()
-            results_list.append({"url": url, "score": similarity})
+            status.update(label=f"📊 Нашёл {len(all_found_links)} статей. Анализирую...", state="running")
 
-        search_status.empty()
-        progress_bar.empty()
+            user_embedding = self.model.encode(user_text, convert_to_tensor=True, show_progress_bar=False)
+            results_list = []
 
-        if not results_list: return None
+            for i, url in enumerate(all_found_links):
+                domain = urlparse(url).netloc or "unknown"
+                status.write(f"📄 {i + 1}/{len(all_found_links)}: {domain}...")
 
-        return max(results_list, key=lambda x: x['score'])
+                # Небольшая пауза, чтобы не получить бан
+                time.sleep(0.7)
+                source_text = self.get_text(url)
+
+                if not source_text:
+                    status.write(f"  ⚠️ Не удалось спарсить {domain}")
+                    continue
+
+                source_embedding = self.model.encode(source_text, convert_to_tensor=True, show_progress_bar=False)
+                similarity = util.cos_sim(user_embedding, source_embedding).item()
+                results_list.append({"url": url, "score": similarity, "domain": domain})
+                status.write(f"  ✅ Сходство: {similarity:.1%}")
+
+            if not results_list:
+                status.error("📄 Ни одна статья не была успешно обработана")
+                return None
+
+            best = max(results_list, key=lambda x: x['score'])
+            status.update(label=f"✅ Лучший результат: {best['domain']} ({best['score']:.1%})", state="complete")
+            return best
 
 # ==========================================
 # ЧАСТЬ 2: ЗАЩИТА
 # ==========================================
 class SecurityLayer:
-    def __init__(self):
-        self.cache = {}
-        self.request_history = []
-        self.rpm_limit = 3
+    def __init__(self, rpm_limit: int = 3, cache_size: int = 50):
+        self.cache: Dict[str, Dict] = {}
+        self.request_history: List[float] = []
+        self.rpm_limit = rpm_limit
+        self.cache_size = cache_size
 
-    def check_rate_limit(self):
+    def check_rate_limit(self) -> bool:
         now = time.time()
         self.request_history = [t for t in self.request_history if now - t < 60]
         if len(self.request_history) >= self.rpm_limit:
@@ -101,60 +159,80 @@ class SecurityLayer:
         self.request_history.append(now)
         return True
 
-    def get_cache(self, text):
-        h = hashlib.md5(text.encode()).hexdigest()
+    def get_cache(self, text: str) -> Optional[Dict]:
+        h = hashlib.sha256(text.encode('utf-8')).hexdigest()
         return self.cache.get(h)
 
-    def set_cache(self, text, result):
-        if len(self.cache) >= 50: self.cache.clear()
-        h = hashlib.md5(text.encode()).hexdigest()
+    def set_cache(self, text: str, result: Optional[Dict]):
+        if len(self.cache) >= self.cache_size:
+            keys_to_remove = list(self.cache.keys())[:self.cache_size // 2]
+            for key in keys_to_remove:
+                del self.cache[key]
+        h = hashlib.sha256(text.encode('utf-8')).hexdigest()
         self.cache[h] = result
 
 
 # ==========================================
 # ЧАСТЬ 3: ИНТЕРФЕЙС
 # ==========================================
-st.set_page_config(page_title="News Checker", page_icon="📰")
+st.set_page_config(page_title="News Checker", page_icon="📰", layout="centered")
 
-if 'logic' not in st.session_state:
-    with st.spinner("Первичная настройка системы..."):
-        st.session_state.brain_v3 = NewsAnalyzer()
-        st.session_state.guard_v3 = SecurityLayer()
+if 'brain_v3' not in st.session_state:
+    try:
+        with st.spinner("🔄 Загрузка моделей..."):
+            st.session_state.brain_v3 = NewsAnalyzer()
+            st.session_state.guard_v3 = SecurityLayer()
+    except Exception as e:
+        st.error(f"❌ Ошибка инициализации: {e}")
+        st.stop()
 
 st.title("📰 News Checker")
-st.write("Введите текст новости для проверки подлинности:")
+st.write("Введите текст новости для проверки подлинности по официальным СМИ:")
 
-user_input = st.text_area(" ", height=200, key="main_input")
+user_input = st.text_area(" ", height=200, key="main_input",
+                          placeholder="Например: В Москве произошло землетрясение магнитудой 5 баллов...")
 
-if st.button("Проверить подлинность"):
-    if len(user_input) < 20:
-        st.error("Текст слишком короткий!")
+if st.button("🔍 Проверить подлинность", type="primary"):
+    if not user_input or len(user_input.strip()) < 20:
+        st.error("⚠️ Текст слишком короткий! Введите минимум 20 символов.")
+        st.stop()
 
-    elif not st.session_state.guard_v3.check_rate_limit():
-        st.warning("⚠️ Слишком много запросов. Подождите 60 секунд.")
+    if not st.session_state.guard_v3.check_rate_limit():
+        st.warning("⚠️ Слишком много запросов. Подождите 60 секунд перед следующей проверкой.")
+        st.stop()
 
+    cached = st.session_state.guard_v3.get_cache(user_input.strip())
+
+    if cached:
+        st.info("♻️ Результат найден в кэше.")
+        result = cached
     else:
-        cached = st.session_state.guard_v3.get_cache(user_input)
+        with st.spinner("🤖 ИИ анализирует официальные СМИ..."):
+            result = st.session_state.brain_v3.find_best_match(user_input.strip())
+            if result and result.get('score') is not None:
+                st.session_state.guard_v3.set_cache(user_input.strip(), result)
 
-        if cached:
-            st.info("Результат найден в кэше.")
-            result = cached
-        else:
-            with st.spinner("ИИ анализирует официальные СМИ..."):
-                result = st.session_state.brain_v3.find_best_match(user_input)
-                if result and "error" not in result:
-                    st.session_state.guard_v3.set_cache(user_input, result)
+    if result and result.get('url'):
+        score = result.get('score', 0)
+        url = result.get('url', '')
+        domain = result.get('domain', urlparse(url).netloc)
 
-        if result:
-            score = result.get('score', 0)
-            url = result.get('url', '')
-            if score >= 0.7:
-                st.success(f"### ПОДТВЕРЖДЕНО ({score:.1%})")
-                st.write(f"**Источник:** {url}")
-            elif score >= 0.4:
-                st.warning(f"### ПОХОЖЕ НА ПРАВДУ ({score:.1%})")
-                st.write(f"Источник: {url}")
-            else:
-                st.error("Точных совпадений в базе СМИ не найдено.")
+        if score >= 0.7:
+            st.success(f"### ✅ ПОДТВЕРЖДЕНО ({score:.1%})")
+            st.write(f"**Источник:** [{domain}]({url})")
+            st.caption("Информация найдена в доверенных СМИ с высокой степенью соответствия.")
+        elif score >= 0.4:
+            st.warning(f"### ⚠️ ПОХОЖЕ НА ПРАВДУ ({score:.1%})")
+            st.write(f"**Источник:** [{domain}]({url})")
+            st.caption("Найдено частичное совпадение. Рекомендуется проверить дополнительные источники.")
         else:
-            st.error("Новость не найдена в базе доверенных СМИ.")
+            st.error("### ❌ Точных совпадений не найдено")
+            st.write(f"Ближайший результат: [{domain}]({url}) с соответствием {score:.1%}")
+            st.caption("Новость не подтверждена в базе доверенных СМИ. Возможно, это фейк или очень свежая информация.")
+    else:
+        st.error("### ❌ Новость не найдена в базе доверенных СМИ")
+        st.caption(
+            "Это не обязательно означает, что новость ложная — возможно, она ещё не опубликована в проверенных источниках.")
+
+st.markdown("---")
+st.caption("🔐 Данные не сохраняются. Проверка осуществляется по открытым источникам.")
